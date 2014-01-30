@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block title %}Mail Archive{% endblock %}
+
+{% block content %}
+
+<h1>Email Archive Help</h1>
+<ul>
+<li>Supported Query Syntax:<a href="http://xapian.org/docs/queryparser.html">http://xapian.org/docs/queryparser.html</a></li>
+<li>Advanced Search: non keyword fields act as a filter on the keyword search</li>
+<li>Supported Field Specifiers: frm, subject, </li>
+<li>Simple search input and Advanced Search keywords search message subject and body</li>
+</ul>
+
+<h1>Search Query Tips</h1>
+<h2>Punctuation Characters</h2>
+<p>Punctuation characters are treated as word separators when indexing.  Therefore they are excluded
+from search queries.  For example a search for "http://www.ietf.org" is translated to "http" and
+"www" and "ietf" and "org", returning any documents containing all these terms.  To improve results
+you can quote the URL, which will return documents where these terms are adjacent to each other.
+</p>
+{% endblock %}
+
+

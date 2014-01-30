@@ -1,0 +1,149 @@
+{% extends "base_960.html" %}
+
+
+{% block title %}Mail Archive - Admin Guide{% endblock %}
+
+{% block header %}{{ block.super }} - Admin Guide{% endblock %}
+
+{% block content %}
+
+<div id="admin_page">
+    <ul>
+        <li><a href="#add_list">How do I add a new list?</a></li>
+        <li><a href="#rebuild_index">How do I rebuild the index for a subset of messages?</a></li>
+        <li><a href="#subpoena">How do I collect messages for response to a subpoena?</a></li>
+        <li><a href="#xapian">Xapian</a></li>
+        <li><a href="#memcached">Memcached</a></li>
+        <li><a href="#rabbitmq">RabbitMQ</a></li>
+        <li><a href="#celery">Celery</a></li>
+    </ul>
+    <hr>
+    
+    <span id="add_list"></span>
+    <h2>How do I add a new list?</h2>
+    <p></p>
+    
+    <span id="add_list"></span>
+    <h2>How do I rebuild the index for a subset of messages?</h2>
+    <p>If you need to rebuild the index for messages updated within a specific date range,
+    first stop the Celery worker from processing new index updates (the updates will safely
+    queue in RabbitMQ and be processed when Celery is restarted.
+    <pre class="example">sudo /etc/init.d/celeryd stop</pre>
+    Then use the Haystack update_index command
+    <pre class="example">cd /a/mailarch/current
+./manage.py update_index --start='2014-01-14T00:00:00' --end='2014-01-16T23:59:59'</pre>
+    Then restart Celery
+    <pre class="example">sudo /etc/init.d/celeryd start</pre>
+    </p>
+    
+    <span id="add_list"></span>
+    <h2>How do I collect messages for response to a subpoena?</h2>
+    <p>If the subpoena calls for messages from a specific list containing a search term, use the
+    standard search interface to export messages from the archive.  In addition you can collect 
+    messages removed as spam in this way:
+    <pre class="example">mkdir /tmp/sub012214
+cd /a/mailarch/data/archive/spam/[listname]
+for fil in `grep -m1 -l searchterm *`; do cp $fil /tmp/sub012214/; done;
+cd /tmp
+tar cvf sub012214.tar ./sub012214</pre></p>
+    
+    <span id="xapian"></span>
+    <h2>Xapian Utilities</h2>
+    <p>The email archive uses the Xapian search engine library.<br><br>
+    To run a database integrity check:
+    <pre class="example">cd /a/mailarch/data
+xapian-check ./archive_index</pre>
+    Show index stats
+    <pre class="example">delve ./archive_index/
+UUID = 2995f642-6fd8-469a-93bb-ac69aea27325
+number of documents = 1473880
+average document length = 2439.13
+document length lower bound = 36
+document length upper bound = 3258372
+highest document id ever used = 1473883
+has positional information = true</pre>
+    Lookup a record in the search index by database primary key
+    <pre class="example">delve -t Qarchive.message.[PK] ./archive_index</pre>
+    Command line search tool
+    <pre class="example">quest -d ./archive_index/ database</pre>
+    </p>
+    <br>
+    
+    <h1>Auxiliary Services</h1>
+    <span id="memcached"></span>
+    <h2>Memcached</h2>
+    <p>Memcached is the cache backend for the Email Archive.<br><br>
+    Start / Stop memcached
+    <pre class="example">service memcached start|stop|restart</pre>
+    Status from the command line
+    <pre class="example">$ telnet localhost 11211
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+stats
+stats items
+quit</pre>
+
+    References:<br>
+    <a href="http://memcached.org">Memcache Homepage</a><br>
+    <a href="http://www.pal-blog.de/entwicklung/perl/memcached-statistics-stats-command.html">Memcached Statistics</a>
+    
+    <span id="rabbitmq"></span>
+    <h2>RabbitMQ</h2>
+    Rabbitmq is the messaging backend for the Email Archive.  It is used to queue index update requests because the Xapian index only support one writer process.  Celery is the corresponding piece that consumes the index update messages.<br><br>
+
+    Start / Stop Rabbitmq server
+    <pre class="example">service rabbitmq-server start|stop|restart
+** NOTE ** stop celery first, or restart after a rabbitmq restart</pre>
+    
+    Check status of server
+    <pre class="example">rabbitmqctl status</pre>
+    
+    List info for the message queue
+    <pre class="example">rabbitmqctl list_queues
+rabbitmqctl list_queues name messages messages_ready messages_unacknowledged</pre>
+    
+    Reset message queue (removes all messages!)
+    <pre class="example">rabbitmqctl stop_app
+rabbitmqctl reset
+rabbitmqctl start_app</pre>
+    List plugins
+    <pre class="example">rabbitmq-plugins list</pre>
+    <br>
+    References:<br>
+    <a href="https://www.rabbitmq.com/man/rabbitmqctl.1.man.html">rabbitmqctl man page</a>
+    
+    <span id="celery"></span>
+    <h2>Celery</h2>
+    Celery is the asynchronous task queue used to queue index updates.  It uses RabbitMQ as it's backend<br>
+    <br>
+    Restart
+    <pre class="example"># /etc/init.d/celeryd restart</pre>
+    
+    Troubleshooting: start celery process with -x
+    <pre class="example"># sh -x /etc/init.d/celeryd start
+-- or --
+# C_FAKEFORK=1 sh -x /etc/init.d/celeryd start</pre>
+    
+    Troubleshooting: ensure perms correct on /a/mailarch/data/log/mlarchive.log<br>
+    Troubleshooting: run worker manually to check for errors
+    <pre class="example">> Starting nodes...
+> worker1@ietfa.amsl.com: * Child terminated with errorcode 255
+FAILED
+
+# su - nobody
+$ /etc/init.d/celery start
+$ cd /a/mailarch/current
+$ export PYTHONPATH=$PWD
+$ celery worker -A mlarchive.celeryapp:app</pre>
+    <br>
+    Solutions for Log File Errors:<br>
+    DatabaseLockError: check perms on flintlock<br>
+    DatabaseOpeningError: check perms on database files<br>
+    DatabaseError:<br>
+    <br>
+    References:<br>
+    <a href="http://docs.celeryproject.org/en/latest/userguide/monitoring.html">Celery admin & monitoring</a><br>
+
+</div> <!-- admin_page -->
+{% endblock %}
