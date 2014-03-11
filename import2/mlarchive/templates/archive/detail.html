@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+<script type="text/javascript" src="{{ STATIC_URL }}js/detail.js"></script>
+{% endblock %}
+
+{% block title %}Archive{% endblock %}
+
+{% block content %}
+
+<div id="msg-detail">
+  {{ msg_html|safe }}
+</div>
+
+<div id="msg-aside">
+</div>
+
+{% endblock %}

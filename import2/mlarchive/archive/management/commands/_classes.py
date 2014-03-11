@@ -1,0 +1,851 @@
+from django.conf import settings
+from django.core.management.base import CommandError
+from dateutil.tz import tzoffset
+from email.header import decode_header
+from email.utils import parsedate, parsedate_tz, mktime_tz, getaddresses, make_msgid
+from mlarchive.archive.models import *
+from mlarchive.archive.management.commands._mimetypes import *
+from mlarchive.utils.decorators import check_datetime
+from mlarchive.utils.encoding import decode_safely
+from pytz import timezone
+from tzparse import tzparse
+
+from collections import deque
+
+import base64
+import datetime
+import email
+import glob
+import hashlib
+import mailbox
+import os
+import pytz
+import random
+import re
+import string
+import time
+import uuid
+
+from django.utils.log import getLogger
+logger = getLogger('mlarchive.custom')
+
+# Suppress database warnings
+#from warnings import filterwarnings
+#filterwarnings('ignore', category = MySQLdb.Warning)
+
+# --------------------------------------------------
+# Globals
+# --------------------------------------------------
+date_formats = ["%a %b %d %H:%M:%S %Y",
+                "%a, %d %b %Y %H:%M:%S %Z",
+                "%a %b %d %H:%M:%S %Y %Z"]
+
+SEPARATOR_PATTERNS = [ re.compile(r'^Return-[Pp]ath:'),
+                       re.compile(r'^Envelope-to:'),
+                       re.compile(r'^Received:'),
+                       re.compile(r'^X-Envelope-From:'),
+                       re.compile(r'^From:'),
+                       re.compile(r'^Date:'),
+                       re.compile(r'^To:'),
+                       re.compile(r'^20[0-1][0-9]$') ]      # odd one, see forces
+
+HEADER_PATTERN = re.compile(r'^[\041-\071\073-\176]{1,}:')
+SENT_PATTERN = re.compile(r'^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(\d{1,2})/(\d{1,2})/(\d{4,4})\s+(\d{1,2}):(\d{2,2})\s+(AM|PM)')
+MSGID_PATTERN = re.compile(r'<([^>]+)>')                    # [^>] means any character except ">"
+ENVELOPE_DATE_PATTERN = re.compile(r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s.+')
+ENVELOPE_DUPETZ_PATTERN = re.compile(r'[\-\+]\d{4} \([A-Z]+\)$')
+
+subj_blob_pattern = r'(\[[\040-\132\134\136-\176]{1,}\]\s*)'
+subj_refwd_pattern = r'([Rr][eE]|F[Ww][d]?)\s*' + subj_blob_pattern + r'?:\s'
+subj_leader_pattern = subj_blob_pattern + r'*' + subj_refwd_pattern
+subj_blob_regex = re.compile(r'^' + subj_blob_pattern)
+subj_leader_regex = re.compile(r'^' + subj_leader_pattern)
+
+#subj_leader = r'^(\[[\040-\132\134\136-\176]{1,}\]\s*)*([Rr][eE]|F[Ww][d]?)\s*(\[[\040-\132\134\136-\176]{1,}\]\s*)?:\s'
+
+# --------------------------------------------------
+# Custom Exceptions
+# --------------------------------------------------
+class DateError(Exception):
+    # failed to parse the message date
+    pass
+
+class GenericWarning(Exception):
+    pass
+
+class NoHeaders(Exception):
+    # the message contains no header fields, usually indicates problem with parsing
+    pass
+
+class UnknownFormat(Exception):
+    # the mail file format is unrecognized
+    pass
+
+# --------------------------------------------------
+# Helper Functions
+# --------------------------------------------------
+def archive_message(data,listname,private=False,save_failed=True):
+    """This function is the internals of the interface to Mailman.  It is called by the
+    standalone script archive-mail.py.  Inputs are:
+    data: the message as a string (comes from sys.stdin.read())
+    listname: a string, provided as command line argument to archive-mail
+    private: boolean, True if the list is private.  Only used if this is a new list
+    save_failed: default is True, set to false when calling from compare utility script
+    """
+    try:
+        msg = email.message_from_string(data)
+        mw = MessageWrapper(msg,listname,private=private)
+        mw.save()
+    except Exception as error:
+        logger.error('Archive message failed [{0}]'.format(error.args))
+        if not save_failed:
+            return 1
+        if msg:
+            save_failed_msg(msg,listname,error)
+        else:
+            save_failed_msg(data,listname,error)
+        return 1    # TODO: other error?
+    return 0
+
+def clean_spaces(s):
+    """Reduce all whitespaces to one space"""
+    s = re.sub(r'\s+',' ',s)
+    return s
+
+def convert_date(date):
+    """Try different patterns to convert string to naive UTC datetime object"""
+    for format in date_formats:
+        try:
+            result = tzparse(date,format)
+            if result:
+                # convert to UTC and make naive
+                utc_tz = timezone('utc')
+                time = utc_tz.normalize(result.astimezone(utc_tz))
+                time = time.replace(tzinfo=None)                # make naive
+                return time
+        except ValueError:
+            pass
+
+def decode_rfc2047_header(text):
+    return ' '.join(decode_safely(s, charset) for s, charset in decode_header(text))
+
+def get_base_subject(text):
+    """Returns 'base subject' of a message.  This is the subject which has specific
+    subject artifacts removed.  This function implements the algorithm defined in
+    section 2.1 of RFC5256
+    """
+    # step 1 - now all handled by normalize
+    # uni = decode_rfc2047_header(text)
+    # utf8 = uni.encode('utf8')
+    # text = clean_spaces(utf8)
+    # text = text.rstrip()
+
+    while True:
+        # step 2
+        while text.endswith('(fwd)'):
+            text = text[:-5].rstrip()
+
+        while True:
+            # step 3
+            textin = text
+            text = subj_leader_regex.sub('',text)
+
+            # step 4
+            m = subj_blob_regex.match(text)
+            if m:
+                temp = subj_blob_regex.sub('',text)
+                if temp:
+                    text = temp
+            if text == textin:    # step 5 (else repeat 3 & 4)
+                break
+
+        # step 6
+        if text.startswith('[Fwd:') and text.endswith(']'):
+            text = text[5:-1]
+            text = text.strip()
+        else:
+            break
+
+    return text
+
+def get_date_part(text):
+    """Returns date portion of the envelope header line.  Based on the observation
+    that all date parts start with abbreviated weekday"""
+    match = ENVELOPE_DATE_PATTERN.search(text)
+    if match:
+        date = match.group()
+
+        # a very few dates have redundant timezone designations on the end
+        # which tzparse can't handle.  If this is the case strip it off
+        # ie. Wed, 6 Jul 2005 12:24:15 +0100 (BST)
+        if ENVELOPE_DUPETZ_PATTERN.search(date):
+            date = re.sub(r'\s\([A-Z]+\)$','',date)
+        return date
+    else:
+        return None
+
+def get_envelope_date(msg):
+    """Returns the date, a naive datetime object converted to UTC, from the message
+    envelope line.  msg is a email.message.Message object
+
+    NOTE: Some files have mangled email addresses in "From" line:
+    iesg/2008-01.mail: From dromasca at avaya.com  Tue Jan  1 04:49:41 2008
+    """
+    line = get_from(msg)
+    if not line:
+        return None
+
+    date = get_date_part(line.rstrip())
+    if date:
+        return convert_date(date)
+
+def get_from(msg):
+    """Returns the 'from' line of message.  This function is required because of the
+    disparity between different message objects.  email.message.Message has a
+    get_unixfrom() method while mailbox.mboxMessage has both get_unixfrom() and
+    a get_from() method, but the get_unixfrom() returns None
+    """
+    if hasattr(msg, 'get_unixfrom'):
+        frm = msg.get_unixfrom()
+        if frm:
+            return frm
+    if hasattr(msg, 'get_from'):
+        frm = msg.get_from()
+        if frm:
+            return frm
+
+def get_header_date(msg):
+    """Returns the date, a naive or aware datetime object converted to UTC, from the
+    message header.  First checks the 'Date:' field, then 'Sent:'.  Returns None if
+    it can't find it locate and interpret either of these.
+    """
+    date = msg.get('date')
+    if not date:
+        date = msg.get('sent')
+
+    if not date:
+        return None
+
+    result = parsedate_to_datetime(date)
+    if result:
+        return result
+
+    # try tzparse for some odd formations
+    date_formats = ["%a %d %b %y %H:%M:%S-%Z",
+                    "%d %b %Y %H:%M-%Z",
+                    "%Y-%m-%d %H:%M:%S"]
+    for format in date_formats:
+        try:
+            result = tzparse(date,format)
+            if result:
+                return result
+        except ValueError:
+            pass
+
+    # try some known patterns that require transformation
+    try:
+        return datetime.datetime.strptime(date,'%A, %B %d, %Y %I:%M %p')
+    except ValueError:
+        pass
+
+    match = SENT_PATTERN.match(date)
+    if match:
+        date_string = '{0} {1}/{2}/{3} {4}:{5} {6}'.format(match.group(1),
+                                                           match.group(2).zfill(2),
+                                                           match.group(3).zfill(2),
+                                                           match.group(4),
+                                                           match.group(5),
+                                                           match.group(6),
+                                                           match.group(7))
+
+        return datetime.datetime.strptime(date_string,'%a %m/%d/%Y %I:%M %p')
+
+def get_mb(path):
+    """Returns a mailbox object.
+    Currently supported types are:
+    - mailbox.mmdf
+    - BetterMbox (derived from mailbox.mbox)
+    - CustomMbox (like mbox but no from line)
+    """
+    with open(path) as f:
+        line = f.readline()
+        while not line or line == '\n':
+            line = f.readline()
+        if line.startswith('From '):
+            return BetterMbox(path)
+        elif line == '\x01\x01\x01\x01\n':
+            return mailbox.MMDF(path)
+        for pattern in SEPARATOR_PATTERNS:
+            if pattern.match(line):
+                return CustomMbox(path,separator=pattern)
+
+    # if we get here the file isn't recognized.  Raise an error
+    raise UnknownFormat('%s, %s' % (path,line))
+
+def get_mime_extension(type):
+    """Returns the proper file extension for the given mime content type (string),
+    returns a tuple of extension, description
+    """
+    if type in CONTENT_TYPES:
+        ext,desc = CONTENT_TYPES[type]
+        # return only the first of multiple extensions
+        return (ext.split(',')[0], desc)
+    # TODO: type without x
+    elif type.startswith('text/'):
+        return ('txt','Text Data')
+    else:
+        return (UNKNOWN_CONTENT_TYPE,type)
+
+def get_received_date(msg):
+    """Returns the date from the received header field.
+    """
+    rec = msg.get('received')
+    if not rec:
+        return None
+
+    parts = rec.split(';')
+    try:
+        return parsedate_to_datetime(parts[1])
+    except IndexError:
+        return None
+
+def is_aware(date):
+    """Returns True if the date object passed in timezone aware, False if naive.
+    See http://docs.python.org/2/library/datetime.html section 8.1.1
+    """
+    if not isinstance(date,datetime.datetime):
+        return False
+    if date.tzinfo and date.tzinfo.utcoffset(date) is not None:
+        return True
+    return False
+
+def parsedate_to_datetime(date):
+    """Returns a datetime object from string.  May return naive or aware datetime.
+
+    This function is from email standard library v3.3, converted to 2.x
+    http://python.readthedocs.org/en/latest/library/email.util.html
+    """
+    try:
+        tuple = parsedate_tz(date)
+        if not tuple:
+            return None
+        tz = tuple[-1]
+        if tz is None:
+            return datetime.datetime(*tuple[:6])
+        return datetime.datetime(*tuple[:6],tzinfo=tzoffset(None,tz))
+    except ValueError:
+        return None
+
+def save_failed_msg(data,listname,error):
+    """Called when an attempt to import a message fails.  "data" will typically be an
+    instance of email.message.Message.  In some odd case where message parsing fails
+    "data" will be a string (this should never happen because the email.parser excepts
+    even empty strings).  Log error entry should contain useful information about the
+    error, the message identity and the filename it is being saved under
+    """
+    # get filename
+    path = os.path.join(settings.ARCHIVE_DIR,'_failed',listname)
+    basename = datetime.datetime.today().strftime('%Y-%m-%d')
+    files = glob.glob(os.path.join(path,basename + '.*'))
+    if files:
+        files.sort()
+        sequence = str(int(files[-1][-4:]) + 1)
+    else:
+        sequence = '0'
+    filename = basename + '.' + sequence.zfill(4)
+
+    # log entry
+    if isinstance(data,email.message.Message):
+        output = data.as_string()
+        if isinstance(data,BetterMbox):
+            identifier = get_from(data)
+        else:
+            identifier = data.get('Message-ID','')
+    else:
+        output = data
+        identifier = ''
+    log_msg = "Import Error [{0}, {1}, {2}]".format(os.path.join(path,filename),(error.__class__,error.args),identifier)
+    logger.error(log_msg)
+
+    # write file
+    if not os.path.exists(path):
+        os.makedirs(path)
+        os.chmod(os.path.dirname(path),02777)
+    filepath = os.path.join(path,filename)
+    with open(filepath,'w') as f:
+        f.write(output)
+    os.chmod(filepath,0660)
+
+# --------------------------------------------------
+# Classes
+# --------------------------------------------------
+class BetterMbox(mailbox.mbox):
+    '''
+    A better mbox class.  We are overriding the _generate_toc function to use a more restrictive
+    From line check.  Based on the deprecated UnixMailbox.  Also, separator lines must be preceeded
+    by a blank line.
+    '''
+    _fromlinepattern = (r'From (.*@.* |MAILER-DAEMON ).{24}')
+    _regexp = None
+
+    def _generate_toc(self):
+        """Generate key-to-(start, stop) table of contents."""
+        starts, stops = [], []
+        lines = deque(' ',maxlen=2)
+        self._file.seek(0)
+        while True:
+            line_pos = self._file.tell()
+            lines.append(self._file.readline())
+            if lines[1][:5] == 'From ' and self._isrealfromline(lines[1]) and not lines[0].strip():
+                if len(stops) < len(starts):
+                    stops.append(line_pos - len(os.linesep))
+                starts.append(line_pos)
+            elif lines[1] == '':
+                stops.append(line_pos)
+                break
+        self._toc = dict(enumerate(zip(starts, stops)))
+        self._next_key = len(self._toc)
+        self._file_length = self._file.tell()
+
+    def _strict_isrealfromline(self, line):
+        if not self._regexp:
+            import re
+            self._regexp = re.compile(self._fromlinepattern)
+        return self._regexp.match(line)
+
+    _isrealfromline = _strict_isrealfromline
+
+class CustomMbox(mailbox.mbox):
+    '''
+    Custom mbox class.  Designed to handle mbox-like files which do not have "From " envelope
+    headers.  Keyword argument "separator" is required.  It is an RE object that is the pattern
+    of the separator line.  ie. "^Envelope-to:".  Separator lines must be preceeded by a blank
+    line.
+    '''
+    def __init__(self, *args, **kwargs):
+        self._separator = kwargs.pop('separator')
+        mailbox.mbox.__init__(self, *args, **kwargs)    # can't use super because mbox is old style class
+
+    def _generate_toc(self):
+        """Generate key-to-(start, stop) table of contents."""
+        starts, stops = [], []
+        lines = deque(' ',maxlen=2)
+        self._file.seek(0)
+        while True:
+            line_pos = self._file.tell()
+            lines.append(self._file.readline())
+            if self._separator.match(lines[1]) and not lines[0].strip():
+                if len(stops) < len(starts):
+                    stops.append(line_pos - len(os.linesep))
+                starts.append(line_pos)
+            elif lines[1] == '':
+                stops.append(line_pos)
+                break
+        self._toc = dict(enumerate(zip(starts, stops)))
+        self._next_key = len(self._toc)
+        self._file_length = self._file.tell()
+
+    def get_message(self, key):
+        """Return a Message representation or raise a KeyError."""
+        start, stop = self._lookup(key)
+        self._file.seek(start)
+        from_line = self._file.readline().replace(os.linesep, '')
+        if HEADER_PATTERN.match(from_line):
+            self._file.seek(start)                      # reset pointer to keep first header line
+        string = self._file.read(stop - self._file.tell())
+        msg = self._message_factory(string.replace(os.linesep, '\n'))
+        msg.set_from(from_line[5:])
+        return msg
+
+class Loader(object):
+    def __init__(self, filename, **options):
+        self.filename = filename
+        self.options = options
+        self.stats = {'count': 0, 'errors': 0, 'spam': 0, 'bytes_loaded': 0}
+        self.private = options.get('private')
+        self.listname = options.get('listname')
+        self.mb = get_mb(filename)
+        self.klass = self.mb.__class__.__name__
+        self.stats[self.klass] = self.stats.get(self.klass, 0) + 1
+
+        logger.info('loader called with: %s' % self.filename)
+
+    def cleanup(self):
+        '''
+        Call this function when you are done with the loader object
+        '''
+        #logger.info('size: %s, loaded: %s' % (self.mb._file_length,self.stats['bytes_loaded']))
+        self.mb.close()
+
+    def load_message(self,msg):
+        '''
+        This function uses MessageWrapper to save a Message to the archive.  If we are in test
+        mode the save() step is skipped.  If this is the firstrun of the import, we filter
+        spam by checking that the message exists in the legacy web archive (which has been
+        purged of spam) before saving.
+
+        NOTE: if the message is from the last 30 days we skip this step, because there will be some
+        lag between when the legacy archive index was created and the firstrun import completes.
+        The check will also be skipped if msgid was not found in the original message and we
+        had to create one, becasue it obviously won't exist in the web archive.
+        '''
+        self.stats['count'] += 1
+
+        mw = MessageWrapper(msg, self.listname, private=self.private)
+
+        # filter using Legacy archive
+        if self.options.get('firstrun') and mw.date < (datetime.datetime.now() - datetime.timedelta(days=30)) and mw.created_id == False:
+            legacy = Legacy.objects.filter(msgid=mw.msgid,email_list_id=self.listname)
+            if not legacy:
+                self.stats['spam'] += 1
+                if not (self.options.get('dryrun') or self.options.get('test')):
+                    mw.write_msg(subdir='spam')
+                return
+
+        # process message
+        x = mw.archive_message
+        self.stats['bytes_loaded'] += mw.bytes
+
+        if not self.options.get('dryrun'):
+            mw.save(test=self.options.get('test'))
+
+    def process(self):
+        '''
+        If the "break" option is set propogate the exception
+        '''
+        for m in self.mb:
+            try:
+                self.load_message(m)
+            except GenericWarning as error:
+                logger.warning("Import Warn [{0}, {1}, {2}]".format(self.filename,error.args,get_from(m)))
+            except Exception as error:
+                save_failed_msg(m,self.listname,error)
+                self.stats['errors'] += 1
+                if self.options.get('break'):
+                    print log_msg
+                    raise
+
+        self.cleanup()
+
+class MessageWrapper(object):
+    '''
+    This class takes a email.message.Message object (email_message) and listname as a string
+    and constructs the mlarchive.archive.models.Message (archive_message) object.
+    Use the save() method to save the message in the archive.
+
+    Use lazy initialization.  On init only get message-id.  If this message is being filtered
+    by message id, no use performing rest of message parsing.
+    '''
+    def __init__(self, email_message, listname, private=False):
+        self._archive_message = None
+        self._date = None
+        self.created_id = False
+        self.email_message = email_message
+        self.hashcode = None
+        self.listname = listname
+        self.private = private
+        self.spam_score = 0
+        self.bytes = len(email_message.as_string(unixfrom=True))
+
+        # fail right away if no headers
+        if not self.email_message.items():         # no headers, something is wrong
+            raise NoHeaders
+
+        self.msgid = self.get_msgid()
+
+    def _get_archive_message(self):
+        "Returns the archive.models.Message instance"
+        if self._archive_message is None:
+            self.process()
+        return self._archive_message
+    archive_message = property(_get_archive_message)
+
+    def _get_date(self):
+        if not self._date:
+            self._date = self.get_date()
+        return self._date
+    date = property(_get_date)
+
+    @check_datetime
+    def get_date(self):
+        '''
+        This function gets the message date.  It takes an email.Message object and returns a naive
+        Datetime object in UTC time.
+
+        First we inspect the Date: header field, since it should correspond with the date and
+        time the message composer sent the email.  It also usually contains the timezone
+        information which is important for calculating correct UTC.  Unfortunately the Date header
+        can vary dramatically in format or even be missing.  Next we check for a Received header
+        which should contain an RFC2822 date.  Lastly we check the envelope header, which should
+        have an asctime date (no timezone info).
+        '''
+        fallback = None
+        for func in (get_envelope_date,get_header_date,get_received_date):
+            date = func(self.email_message)
+            if date:
+                if is_aware(date):
+                    try:
+                        return date.astimezone(pytz.utc).replace(tzinfo=None)   # return as naive UTC
+                    except ValueError:
+                        pass
+                else:
+                    return date
+            # if get_received_date fails could be spam or corrupt message, flag it
+            elif func.__name__ == 'get_received_date':
+                self.spam_score = self.spam_score | settings.MARK_BITS['NO_RECVD_DATE']
+
+        #logger.warning("Import Warn [{0}, {1}, {2}]".format(self.msgid,'Used None or naive date',
+        #                                                 self.email_message.get_from()))
+
+        else:
+            # can't really proceed without a date, this likely indicates bigger parsing error
+            raise DateError("%s, %s" % (self.msgid,self.email_message.get_unixfrom()))
+
+    def get_hash(self):
+        '''
+        Takes the msgid and returns the hashcode
+        '''
+        sha = hashlib.sha1(self.msgid)
+        sha.update(self.listname)
+        return base64.urlsafe_b64encode(sha.digest())
+
+    def get_msgid(self):
+        msgid = self.normalize(self.email_message.get('Message-ID',''))
+        if msgid:
+            msgid = msgid.strip('<>')
+        else:
+            # see if this is a resent Message, which sometimes have missing Message-ID field
+            resent_msgid = self.email_message.get('Resent-Message-ID')
+            if resent_msgid:
+                msgid = resent_msgid.strip('<>')
+        if not msgid:
+            msgid = make_msgid('ARCHIVE')
+            self.created_id = True
+            self.spam_score = self.spam_score | settings.MARK_BITS['NO_MSGID']
+            #raise GenericWarning('No MessageID (%s)' % self.email_message.get_from())
+        return msgid
+
+    def get_random_name(self, ext):
+        '''
+        This function generates a randomized filename for storing attachments.  It takes the
+        file extension as a string and builds a name like extXXXXXXXXXX.ext, where X is a random
+        letter digit or underscore, and ext is the file extension.
+        '''
+        chars = string.ascii_lowercase + string.ascii_uppercase + string.digits + '_'
+        rand = ''.join(random.choice(chars) for x in range(10))
+        return '%s%s.%s' % (ext, rand, ext)
+
+    def get_subject(self):
+        '''
+        This function gets the message subject.  If the subject looks like spam, long line with
+        no spaces, truncate it so as not to cause index errors
+        '''
+        subject = self.normalize(self.email_message.get('Subject',''))
+        # TODO: spam?
+        #if len(subject) > 120 and len(subject.split()) == 1:
+        #    subject = subject[:120]
+        return subject
+
+    def get_to(self):
+        '''
+        Use utility functions to extract RFC2822 addresses.  Returns a string with space
+        deliminated addresses and names.
+        '''
+        to = self.email_message.get('to')
+        if not to:
+            return ''
+        result = []
+        addrs = getaddresses([decode_rfc2047_header(to)])   # getaddresses takes a sequence
+        # flatten list of tuples
+        for tuple in addrs:
+            result = result + list(tuple)
+
+        return ' '.join(result)
+
+    def get_thread(self):
+        '''
+        This is a simplified version of the Zawinski threading algorithm.  The process is:
+        1) If there are References, lookup the first message-id in the list and return it's thread.
+           If the message isn't found try the next message-id, repeat.  According to RFC1036
+           the references list is ordered oldest first.  To start searching from the nearest
+           thread sibling reverse the list.
+        2) If 'In-Reply-To-' is set, look up that message and return it's thread id.
+        3) If the subject line has a "Re:" prefix look for the message matching base-subject
+           and return it's thread
+        4) If none of the above, return a new thread id
+
+        Messages must be loaded in chronological order for this to work properly.
+
+        Referecnces:
+        - http://www.jwz.org/doc/threading.html
+        - http://tools.ietf.org/html/rfc5256
+        '''
+        # TODO: one option is to leave these fields off the model instance
+
+        # try References
+        if self.references:
+            msgids = re.findall(MSGID_PATTERN,self.references)
+            for msgid in msgids:
+                try:
+                    message = Message.objects.get(msgid=msgid)
+                    return message.thread
+                except (Message.DoesNotExist, Message.MultipleObjectsReturned):
+                    pass
+
+        # try In-Reply-to.  Use first msgid found, typically only one
+        if self.in_reply_to:
+            msgids = re.findall(MSGID_PATTERN,self.in_reply_to)
+            if msgids:
+                try:
+                    message = Message.objects.get(msgid=msgids[0])
+                    return message.thread
+                except (Message.DoesNotExist, Message.MultipleObjectsReturned):
+                    pass
+
+        # check subject
+        if self.subject != self.base_subject:
+            messages = Message.objects.filter(email_list=self.email_list,
+                                              date__lt=self.date,
+                                              subject=self.base_subject).order_by('-date')
+            if messages:
+                return messages[0].thread
+
+        # return a new thread
+        return Thread.objects.create()
+
+    def normalize(self, header_text):
+        '''
+        This function takes some header_text as a string.
+        It returns the string decoded and normalized.
+        Checks if the header needs decoding:
+        - if text contains encoded_words, "=?", use decode_rfc2047_header()
+        - or call decode_safely
+        - finally, compress whitespace characters to one space
+        '''
+        if not header_text:                  # just return if we are passed an empty string
+            return header_text
+
+        # TODO: need this?
+        #if type(header_text) is unicode:    # return if already unicode
+        #    return header_text              # ie. get_filename() for example sometimes returns unicode
+
+        if '=?' in header_text:              # handle RFC2047 encoded-words
+            normal = decode_rfc2047_header(header_text)
+        else:
+            normal = decode_safely(header_text)
+
+        # encode as UTF8 and compress whitespace
+        normal = normal.encode('utf8')
+        normal = clean_spaces(normal)
+        return normal.rstrip()
+
+    def process(self):
+        '''
+        Perform the rest of the parsing and construct the Message object.  Note, we are not
+        saving the object to the database.  This happens in the save() function.
+        '''
+        self.email_list,created = EmailList.objects.get_or_create(
+            name=self.listname,defaults={'description':self.listname,'private':self.private})
+        self.hashcode = self.get_hash()
+        self.in_reply_to = self.email_message.get('In-Reply-To','')
+        self.references = self.email_message.get('References','')
+        self.subject = self.get_subject()
+        self.base_subject = get_base_subject(self.subject)
+        self.thread = self.get_thread()
+
+        self._archive_message = Message(date=self.date,
+                             email_list=self.email_list,
+                             frm = self.normalize(self.email_message.get('From','')),
+                             hashcode=self.hashcode,
+                             in_reply_to=self.in_reply_to,
+                             msgid=self.msgid,
+                             subject=self.subject,
+                             references=self.references,
+                             base_subject=self.base_subject,
+                             spam_score=self.spam_score,
+                             thread=self.thread,
+                             to=self.get_to())
+        # not saving here.
+
+    def process_attachments(self, test=False):
+        '''
+        This function walks the message parts and saves any attachments
+        '''
+        for part in self.email_message.walk():
+            # TODO can we have an attachment without a filename (content disposition) ??
+            name = part.get_filename()
+            type = part.get_content_type()
+            if name and type in CONTENT_TYPES:     # indicates an attachment
+                extension,description = get_mime_extension(type)
+
+                # create record
+                attach = Attachment.objects.create(message=self.archive_message,
+                                                   description=description,
+                                                   name=name)
+
+                # handle unrecognized
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    attach.error = '<<< %s; name=%s: Unrecognized >>>' % (type,name)
+                    attach.save()
+                    continue
+
+                # write to disk
+                if not test:
+                    for i in range(10):     # try up to ten random filenames
+                        filename = self.get_random_name(extension)
+                        path = os.path.join(self.archive_message.get_attachment_path(),filename)
+                        if not os.path.exists(path):
+                            with open(path, 'wb') as f:
+                                f.write(payload)
+                                attach.filename = filename
+                                attach.save()
+                            os.chmod(path,0660)
+                            break
+                        else:
+                            logger.error("ERROR: couldn't pick unique attachment name in ten tries (list:%s)" % (self.listname))
+
+    def save(self, test=False):
+        '''
+        Ensure message is not duplicate message-id or hash.  Save message to database.  Save
+        to disk (if not test mode) and process attachments.
+        '''
+        # ensure process has been run
+        # self._get_archive_message()
+
+        # check for duplicate message id, and skip
+        if Message.objects.filter(msgid=self.msgid,email_list__name=self.listname):
+            raise GenericWarning('Duplicate msgid: %s' % self.msgid)
+
+        # check for duplicate hash
+        if Message.objects.filter(hashcode=self.hashcode):
+            # TODO different error?
+            raise CommandError('Duplicate hash, msgid: %s' % self.msgid)
+
+        self.archive_message.save()     # save to database
+        if not test:
+            self.write_msg()            # write to disk archive
+
+        # now that the archive.Message object is created we can process any attachments
+        self.process_attachments(test=test)
+
+    def write_msg(self,subdir=None):
+        '''
+        Write a copy of the original email message to the disk archive.
+        Use optional argument subdir to specify a special location,
+        ie. "spam" or "failure" subdirectory.
+        '''
+        filename = self.hashcode
+        if not filename:
+            filename = str(uuid.uuid4())
+
+        if subdir:
+            path = os.path.join(settings.ARCHIVE_DIR,subdir,self.listname,filename)
+        else:
+            path = os.path.join(settings.ARCHIVE_DIR,self.listname,filename)
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+            os.chmod(os.path.dirname(path),02777)
+        with open(path,'w') as f:
+            f.write(self.email_message.as_string())
+        os.chmod(path,0660)
