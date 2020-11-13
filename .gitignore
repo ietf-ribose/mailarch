@@ -17,3 +17,4 @@
 # Simulated Subversion default ignores end here
 /env
 /.env
+/.gitignore
